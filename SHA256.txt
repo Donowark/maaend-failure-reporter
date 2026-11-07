@@ -1,1 +1,1 @@
-472f432e853e16edbb3ede08243de532a9680f133685b4630eb0c102868be315  MaaEndFailureReporter.exe
+2dd7441c58cf1f57baf3fc662950d5c039b89efb230212585d71ebe02e9ebe3a  MaaEndFailureReporter.exe

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"sort"
@@ -50,28 +51,32 @@ type InterfaceReply struct {
 	Translations map[string]map[string]string `json:"translations"`
 }
 type Snapshot struct {
-	Config       Config
-	States       States
-	Interface    InterfaceReply
-	LabelWarning string
+	Config          Config
+	States          States
+	Interface       InterfaceReply
+	LabelWarning    string
+	MetadataWarning string
+	ObservedAt      time.Time
 }
 type Failure struct {
 	Position int
 	ID, Name string
 }
 
-const version = "0.2.0"
+const version = "0.3.0"
 const overallTimeout = 100 * time.Second
 
 type apiClient struct {
-	timeout     time.Duration
-	attempts    int
-	delay       time.Duration
-	diagnostics []string
+	timeout      time.Duration
+	attempts     int
+	delay        time.Duration
+	diagnostics  []string
+	metadataPath string
+	probeTimeout time.Duration
 }
 
 func newAPIClient() *apiClient {
-	return &apiClient{timeout: 10 * time.Second, attempts: 3, delay: time.Second}
+	return &apiClient{timeout: 10 * time.Second, attempts: 3, delay: time.Second, probeTimeout: 3 * time.Second}
 }
 func transientError(err error) bool {
 	var netErr net.Error
@@ -79,7 +84,7 @@ func transientError(err error) bool {
 }
 func (c *apiClient) getJSON(ctx context.Context, port int, path string, out any) error {
 	// Only loopback GETs. Do not inherit an HTTP proxy or follow redirects.
-	client := &http.Client{Transport: &http.Transport{Proxy: nil}, Timeout: c.timeout,
+	client := &http.Client{Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, Timeout: c.timeout,
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	defer client.CloseIdleConnections()
 	started := time.Now()
@@ -93,6 +98,8 @@ func (c *apiClient) getJSON(ctx context.Context, port int, path string, out any)
 		if err != nil {
 			return err
 		}
+		trace := &requestTrace{started: start}
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace.hooks()))
 		retry := false
 		resp, err := client.Do(req)
 		if err != nil {
@@ -119,7 +126,7 @@ func (c *apiClient) getJSON(ctx context.Context, port int, path string, out any)
 		if err != nil {
 			result = err.Error()
 		}
-		c.diagnostics = append(c.diagnostics, fmt.Sprintf("/api/%s 第 %d/%d 次；耗时 %s；结果：%s", path, attempt, c.attempts, time.Since(start).Round(time.Millisecond), result))
+		c.diagnostics = append(c.diagnostics, fmt.Sprintf("/api/%s 第 %d/%d 次；耗时 %s；结果：%s", path, attempt, c.attempts, time.Since(start).Round(time.Millisecond), result)+trace.summary())
 		if err == nil {
 			return nil
 		}
@@ -145,20 +152,62 @@ func fetch(ctx context.Context, port int) (Snapshot, error) {
 }
 func fetchWithClient(ctx context.Context, port int, client *apiClient) (Snapshot, error) {
 	var s Snapshot
-	if err := client.getJSON(ctx, port, "config", &s.Config); err != nil {
-		return s, err
-	}
-	if len(s.Config.Instances) == 0 {
-		return s, errors.New("接口未返回任何任务列表，请确认 MaaEnd 已加载配置")
-	}
+	// Acquire fresh statuses before asking for optional task names/configuration.
 	if err := client.getJSON(ctx, port, "maa/state", &s.States); err != nil {
-		return s, err
+		client.probeService(ctx, port)
+		return s, fmt.Errorf("实时任务状态读取失败，不能使用历史状态替代：%w", err)
 	}
+	s.ObservedAt = time.Now()
 	if s.States.Instances == nil {
 		return s, errors.New("当前 MXU 的状态接口不兼容：缺少 instances 字段")
 	}
-	if err := client.getJSON(ctx, port, "interface", &s.Interface); err != nil {
+	configErr := client.getJSON(ctx, port, "config", &s.Config)
+	if configErr == nil {
+		configErr = validateConfig(s.Config)
+	}
+	if configErr != nil {
+		// Newer MXU provides a revisioned snapshot; older versions return 404.
+		var snapshot struct {
+			Config Config `json:"config"`
+		}
+		alternateErr := client.quickJSON(ctx, port, "config/snapshot", &snapshot)
+		if alternateErr == nil {
+			alternateErr = validateConfig(snapshot.Config)
+		}
+		if alternateErr == nil {
+			s.Config = snapshot.Config
+			s.MetadataWarning = "主配置接口不可用，已使用本次 /api/config/snapshot 的配置。"
+		} else {
+			cached, cacheErr := readMetadata(client.metadataPath, port)
+			if cacheErr == nil {
+				s.Config = cached.Config
+				// Cached labels only; never deserialize or use cached run states.
+				s.MetadataWarning = fmt.Sprintf("配置接口不可用，名称和顺序来自 %s 的元数据缓存，可能已过时；成功/失败状态来自本次实时读取。", cached.SavedAt.Format(time.RFC3339))
+			} else {
+				// A live instance ID still permits complete failure-ID reporting on first use.
+				ids := make([]string, 0, len(s.States.Instances))
+				for id := range s.States.Instances {
+					ids = append(ids, id)
+				}
+				sort.Strings(ids)
+				s.Config = Config{}
+				for _, id := range ids {
+					s.Config.Instances = append(s.Config.Instances, Instance{ID: id, Name: "名称不可用（ID：" + id + "）"})
+				}
+				s.MetadataWarning = "配置和名称缓存均不可用：只能按列表 ID 选择，失败项以任务 ID 保留；不根据列表名猜测。请在空闲时运行 Check.cmd 建立名称缓存。"
+			}
+			client.diagnostics = append(client.diagnostics, fmt.Sprintf("配置降级：主接口：%v；备用接口：%v；名称缓存：%v", configErr, alternateErr, cacheErr))
+		}
+	}
+	// Translations are optional and must not consume the full retry budget.
+	if err := client.quickJSON(ctx, port, "interface", &s.Interface); err != nil {
 		s.LabelWarning = "界面任务名称翻译不可用；使用配置中的任务名。"
+	}
+	// Never replace a good cache with fallback/cached metadata.
+	if configErr == nil || strings.Contains(s.MetadataWarning, "本次 /api/config/snapshot") {
+		if err := saveMetadata(client.metadataPath, port, s); err != nil {
+			client.diagnostics = append(client.diagnostics, "名称缓存保存失败（不影响本次实时清单）："+err.Error())
+		}
 	}
 	return s, nil
 }
@@ -265,6 +314,9 @@ func report(s Snapshot, i Instance, st InstanceState, when time.Time) (string, e
 	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "MaaEnd 失败任务清单\n生成时间：%s\n任务列表：%s\n列表 ID：%s\n来源：MXU 本机任务状态接口\n\n", when.Format("2006-01-02 15:04:05 -0700"), i.Name, i.ID)
+	if !s.ObservedAt.IsZero() {
+		fmt.Fprintf(&b, "实时状态读取时间：%s\n", s.ObservedAt.Format(time.RFC3339))
+	}
 	fmt.Fprintf(&b, "失败：%d；成功：%d；运行中：%d；等待中：%d\n", len(failed), counts["succeeded"], counts["running"], counts["pending"])
 	b.WriteString("统计范围：调用时这个列表已登记的任务状态；尚未执行的后续任务不计入失败。\n\n")
 	if len(st.Run.Statuses) == 0 {
@@ -275,6 +327,9 @@ func report(s Snapshot, i Instance, st InstanceState, when time.Time) (string, e
 		for n, f := range failed {
 			fmt.Fprintf(&b, "%d. %s\n   列表位置：%d；任务 ID：%s\n", n+1, f.Name, f.Position, f.ID)
 		}
+	}
+	if s.MetadataWarning != "" {
+		fmt.Fprintf(&b, "\n说明：%s\n", s.MetadataWarning)
 	}
 	if s.LabelWarning != "" {
 		fmt.Fprintf(&b, "\n说明：%s\n", s.LabelWarning)
@@ -297,6 +352,9 @@ func checkReport(s Snapshot, port int) string {
 		} else {
 			fmt.Fprintf(&b, "状态格式：兼容；登记任务 %d；失败 %d；成功 %d\n\n", len(st.Run.Statuses), len(f), c["succeeded"])
 		}
+	}
+	if s.MetadataWarning != "" {
+		fmt.Fprintf(&b, "\n说明：%s\n", s.MetadataWarning)
 	}
 	b.WriteString("自动运行时建议明确指定 --instance 列表名；多列表并行时必须指定。\n")
 	return b.String()
@@ -359,6 +417,9 @@ func execute() int {
 	ctx, cancel := context.WithTimeout(context.Background(), overallTimeout)
 	defer cancel()
 	client := newAPIClient()
+	if base := fallbackPath(); base != "" {
+		client.metadataPath = filepath.Join(base, fmt.Sprintf("metadata-%d.json", *port))
+	}
 	var content string
 	kind := "失败任务"
 	if err == nil {
