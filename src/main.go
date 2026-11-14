@@ -31,7 +31,9 @@ type Config struct {
 	Instances []Instance `json:"instances"`
 }
 type RunState struct {
-	Statuses map[string]string `json:"statuses"`
+	Statuses      map[string]string `json:"statuses"`
+	Mappings      map[int64]string  `json:"mappings"`
+	QueuedTaskIDs []int64           `json:"pending_task_ids"`
 }
 type InstanceState struct {
 	Running bool      `json:"is_running"`
@@ -57,13 +59,14 @@ type Snapshot struct {
 	LabelWarning    string
 	MetadataWarning string
 	ObservedAt      time.Time
+	AfterRun        bool
 }
 type Failure struct {
 	Position int
 	ID, Name string
 }
 
-const version = "0.3.0"
+const version = "0.3.1"
 const overallTimeout = 100 * time.Second
 
 type apiClient struct {
@@ -79,9 +82,21 @@ func newAPIClient() *apiClient {
 	return &apiClient{timeout: 10 * time.Second, attempts: 3, delay: time.Second, probeTimeout: 3 * time.Second}
 }
 func transientError(err error) bool {
+	var status httpStatusError
+	if errors.As(err, &status) {
+		switch status {
+		case 408, 429, 500, 502, 503, 504:
+			return true
+		}
+	}
 	var netErr net.Error
 	return errors.As(err, &netErr) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)
 }
+
+type httpStatusError int
+
+func (status httpStatusError) Error() string { return fmt.Sprintf("HTTP %d", int(status)) }
+
 func (c *apiClient) getJSON(ctx context.Context, port int, path string, out any) error {
 	// Only loopback GETs. Do not inherit an HTTP proxy or follow redirects.
 	client := &http.Client{Transport: &http.Transport{Proxy: nil, DisableKeepAlives: true}, Timeout: c.timeout,
@@ -106,11 +121,8 @@ func (c *apiClient) getJSON(ctx context.Context, port int, path string, out any)
 			retry = transientError(err)
 		} else {
 			if resp.StatusCode != http.StatusOK {
-				err = fmt.Errorf("HTTP %d", resp.StatusCode)
-				switch resp.StatusCode {
-				case 408, 429, 500, 502, 503, 504:
-					retry = true
-				}
+				err = httpStatusError(resp.StatusCode)
+				retry = transientError(err)
 			} else {
 				// Decode into temporary bytes so failed reads never contaminate the output.
 				var raw json.RawMessage
@@ -161,6 +173,11 @@ func fetchWithClient(ctx context.Context, port int, client *apiClient) (Snapshot
 	if s.States.Instances == nil {
 		return s, errors.New("当前 MXU 的状态接口不兼容：缺少 instances 字段")
 	}
+	client.loadMetadata(ctx, port, &s)
+	return s, nil
+}
+
+func (client *apiClient) loadMetadata(ctx context.Context, port int, s *Snapshot) {
 	configErr := client.getJSON(ctx, port, "config", &s.Config)
 	if configErr == nil {
 		configErr = validateConfig(s.Config)
@@ -205,11 +222,10 @@ func fetchWithClient(ctx context.Context, port int, client *apiClient) (Snapshot
 	}
 	// Never replace a good cache with fallback/cached metadata.
 	if configErr == nil || strings.Contains(s.MetadataWarning, "本次 /api/config/snapshot") {
-		if err := saveMetadata(client.metadataPath, port, s); err != nil {
+		if err := saveMetadata(client.metadataPath, port, *s); err != nil {
 			client.diagnostics = append(client.diagnostics, "名称缓存保存失败（不影响本次实时清单）："+err.Error())
 		}
 	}
-	return s, nil
 }
 func choose(s Snapshot, selector string) (Instance, error) {
 	if selector != "" {
@@ -318,7 +334,11 @@ func report(s Snapshot, i Instance, st InstanceState, when time.Time) (string, e
 		fmt.Fprintf(&b, "实时状态读取时间：%s\n", s.ObservedAt.Format(time.RFC3339))
 	}
 	fmt.Fprintf(&b, "失败：%d；成功：%d；运行中：%d；等待中：%d\n", len(failed), counts["succeeded"], counts["running"], counts["pending"])
-	b.WriteString("统计范围：调用时这个列表已登记的任务状态；尚未执行的后续任务不计入失败。\n\n")
+	if s.AfterRun {
+		b.WriteString("统计范围：指定列表进入终态后读取的本轮任务状态。\n\n")
+	} else {
+		b.WriteString("统计范围：调用时这个列表已登记的任务状态；尚未执行的后续任务不计入失败。\n\n")
+	}
 	if len(st.Run.Statuses) == 0 {
 		b.WriteString("当前列表没有已登记的运行状态，不能据此认定全部任务成功。\n")
 	} else if len(failed) == 0 {
@@ -399,6 +419,7 @@ func execute() int {
 	instance := flag.String("instance", "", "任务列表名或 ID；默认选择唯一运行中的列表")
 	out := flag.String("output-dir", "", "覆盖报告目录；默认使用 Windows 实际桌面路径")
 	check := flag.Bool("check", false, "检查接口并输出列表 ID 与权限诊断")
+	afterRun := flag.Bool("after-run", false, "用于最后一项且关闭「等待退出」的自定义程序；等待指定列表完成再导出")
 	strict := flag.Bool("strict", false, "检测或写入失败时返回非零退出码；默认记录异常后退出 0，让 MaaEnd 继续")
 	flag.Parse()
 	if *port < 1 || *port > 65535 {
@@ -407,6 +428,10 @@ func execute() int {
 	}
 	if flag.NArg() != 0 {
 		fmt.Fprintln(os.Stderr, "存在未识别的参数；含空格的列表名须加引号")
+		return 2
+	}
+	if *afterRun && (*check || strings.TrimSpace(*instance) == "") {
+		fmt.Fprintln(os.Stderr, "--after-run 需要 --instance，且不能与 --check 同时使用")
 		return 2
 	}
 	dir := *out
@@ -424,7 +449,11 @@ func execute() int {
 	kind := "失败任务"
 	if err == nil {
 		var s Snapshot
-		s, err = fetchWithClient(ctx, *port, client)
+		if *afterRun {
+			s, err = client.fetchAfterRun(ctx, *port, *instance)
+		} else {
+			s, err = fetchWithClient(ctx, *port, client)
+		}
 		if err == nil {
 			if *check {
 				content = checkReport(s, *port)
@@ -446,6 +475,9 @@ func execute() int {
 	if err != nil {
 		kind = "导出异常"
 		content = fmt.Sprintf("MaaEnd 失败任务导出未完成\n时间：%s\n原因：%s\n\n未将识别失败当成零个失败任务。\n请确认 MaaEnd 已启动，设置中的 Web 服务已启用、端口与 --port 相符，以及当前 MXU 支持 /api/maa/state 中的逐任务状态。\n执行 --check 可查看列表 ID；使用 --instance 指定目标列表。\n默认不会阻止后续 MaaEnd 任务；修复后重新导出。\n", time.Now().Format(time.RFC3339), err)
+		if *afterRun {
+			content += "请确认导出器是最后一项，「等待退出」已关闭，并保持 MaaEnd 开启直到报告生成。\n"
+		}
 		fmt.Fprintln(os.Stderr, err)
 	}
 	content += client.diagnosticReport()
