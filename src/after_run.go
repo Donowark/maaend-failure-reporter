@@ -15,6 +15,7 @@ func (c *apiClient) fetchAfterRun(ctx context.Context, port int, selector string
 	var instanceID string
 	var queue []int64
 	var lastReadError error
+	heartbeatProbed := false
 	for ctx.Err() == nil {
 		var live States
 		lastReadError = c.quickJSON(ctx, port, "maa/state", &live)
@@ -55,6 +56,9 @@ func (c *apiClient) fetchAfterRun(ctx context.Context, port int, selector string
 			}
 		} else if ctx.Err() == nil && !transientError(lastReadError) {
 			return s, lastReadError
+		} else if !heartbeatProbed && ctx.Err() == nil {
+			heartbeatProbed = true
+			c.probeHeartbeat(ctx, port)
 		}
 
 		timer := time.NewTimer(c.delay)

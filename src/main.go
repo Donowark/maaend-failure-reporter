@@ -66,20 +66,21 @@ type Failure struct {
 	ID, Name string
 }
 
-const version = "0.3.1"
+const version = "0.3.2"
 const overallTimeout = 100 * time.Second
 
 type apiClient struct {
-	timeout      time.Duration
-	attempts     int
-	delay        time.Duration
-	diagnostics  []string
-	metadataPath string
-	probeTimeout time.Duration
+	timeout         time.Duration
+	attempts        int
+	delay           time.Duration
+	diagnostics     []string
+	metadataPath    string
+	probeTimeout    time.Duration
+	recoveryTimeout time.Duration
 }
 
 func newAPIClient() *apiClient {
-	return &apiClient{timeout: 10 * time.Second, attempts: 3, delay: time.Second, probeTimeout: 3 * time.Second}
+	return &apiClient{timeout: 10 * time.Second, attempts: 3, delay: time.Second, probeTimeout: 3 * time.Second, recoveryTimeout: 40 * time.Second}
 }
 func transientError(err error) bool {
 	var status httpStatusError
@@ -134,6 +135,9 @@ func (c *apiClient) getJSON(ctx context.Context, port int, path string, out any)
 			}
 			resp.Body.Close()
 		}
+		if errors.Is(err, context.DeadlineExceeded) && trace.awaitingFirstByte() {
+			err = &headerTimeout{err}
+		}
 		result := "成功"
 		if err != nil {
 			result = err.Error()
@@ -157,7 +161,7 @@ func (c *apiClient) getJSON(ctx context.Context, port int, path string, out any)
 	return fmt.Errorf("本机接口 /api/%s 请求失败（累计耗时 %s）：%w", path, time.Since(started).Round(time.Millisecond), lastErr)
 }
 func (c *apiClient) diagnosticReport() string {
-	return fmt.Sprintf("\n请求诊断（程序 v%s）\n单次超时：%s；每个接口最多尝试：%d 次；重试间隔：%s；整体期限：%s\n%s\n", version, c.timeout, c.attempts, c.delay, overallTimeout, strings.Join(c.diagnostics, "\n"))
+	return fmt.Sprintf("\n请求诊断（程序 v%s）\n常规读取超时：%s；常规读取最多尝试：%d 次；重试间隔：%s；整体期限：%s\n%s\n", version, c.timeout, c.attempts, c.delay, overallTimeout, strings.Join(c.diagnostics, "\n"))
 }
 func fetch(ctx context.Context, port int) (Snapshot, error) {
 	return fetchWithClient(ctx, port, newAPIClient())
@@ -167,7 +171,16 @@ func fetchWithClient(ctx context.Context, port int, client *apiClient) (Snapshot
 	// Acquire fresh statuses before asking for optional task names/configuration.
 	if err := client.getJSON(ctx, port, "maa/state", &s.States); err != nil {
 		client.probeService(ctx, port)
-		return s, fmt.Errorf("实时任务状态读取失败，不能使用历史状态替代：%w", err)
+		var stalled *headerTimeout
+		if errors.As(err, &stalled) && ctx.Err() == nil && client.recoveryTimeout > 0 {
+			client.diagnostics = append(client.diagnostics, fmt.Sprintf("探测结束，重新读取实时状态；本次最多等待 %s。", client.recoveryTimeout))
+			recovered := States{}
+			err = client.singleJSON(ctx, port, "maa/state", &recovered, client.recoveryTimeout)
+			s.States = recovered
+		}
+		if err != nil {
+			return s, fmt.Errorf("实时任务状态读取失败，不能使用历史状态替代：%w", err)
+		}
 	}
 	s.ObservedAt = time.Now()
 	if s.States.Instances == nil {
@@ -442,6 +455,13 @@ func execute() int {
 	ctx, cancel := context.WithTimeout(context.Background(), overallTimeout)
 	defer cancel()
 	client := newAPIClient()
+	mode := "即时导出"
+	if *afterRun {
+		mode = "任务结束后导出 (--after-run)"
+	} else if *check {
+		mode = "兼容性检查 (--check)"
+	}
+	client.diagnostics = append(client.diagnostics, fmt.Sprintf("启动时间：%s；模式：%s；列表参数：%q；目标：127.0.0.1:%d", time.Now().Format(time.RFC3339Nano), mode, *instance, *port))
 	if base := fallbackPath(); base != "" {
 		client.metadataPath = filepath.Join(base, fmt.Sprintf("metadata-%d.json", *port))
 	}
@@ -453,6 +473,10 @@ func execute() int {
 			s, err = client.fetchAfterRun(ctx, *port, *instance)
 		} else {
 			s, err = fetchWithClient(ctx, *port, client)
+			var stalled *headerTimeout
+			if !*check && errors.As(err, &stalled) {
+				client.diagnostics = append(client.diagnostics, "即时导出等待响应首字节超时。如需整轮结果，请将导出器放到最后一项、关闭「等待退出」，并添加 --instance \"实际列表名\" --after-run。保持 MaaEnd 开启直到报告生成。")
+			}
 		}
 		if err == nil {
 			if *check {

@@ -34,6 +34,16 @@ func (t *requestTrace) hooks() *httptrace.ClientTrace {
 		GotFirstResponseByte: func() { t.mu.Lock(); defer t.mu.Unlock(); t.firstByte = true },
 	}
 }
+
+type headerTimeout struct{ error }
+
+func (e *headerTimeout) Unwrap() error { return e.error }
+func (t *requestTrace) awaitingFirstByte() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.written && !t.firstByte
+}
+
 func (t *requestTrace) summary() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -55,13 +65,44 @@ func (c *apiClient) quickJSON(ctx context.Context, port int, path string, out an
 	if timeout <= 0 {
 		timeout = c.timeout
 	}
+	return c.singleJSON(ctx, port, path, out, timeout)
+}
+
+func (c *apiClient) singleJSON(ctx context.Context, port int, path string, out any, timeout time.Duration) error {
 	quick := &apiClient{timeout: timeout, attempts: 1}
 	err := quick.getJSON(ctx, port, path, out)
 	c.diagnostics = append(c.diagnostics, quick.diagnostics...)
 	return err
 }
 
+func (c *apiClient) probeHeartbeat(ctx context.Context, port int) {
+	if ctx.Err() != nil {
+		return
+	}
+	if owner := listenerOwner(ctx, port); owner != "" {
+		c.diagnostics = append(c.diagnostics, owner)
+	}
+	var reply struct {
+		OK bool `json:"ok"`
+	}
+	err := c.quickJSON(ctx, port, "heartbeat", &reply)
+	var status httpStatusError
+	var result string
+	switch {
+	case err == nil && reply.OK:
+		result = "心跳正常；此刻 HTTP 服务可以处理轻量请求。"
+	case errors.As(err, &status) && status == 404:
+		result = "心跳返回 404；该服务可能不支持此路由。"
+	case err == nil:
+		result = "心跳响应格式不符；请核对端口和服务版本。"
+	default:
+		result = "未取得有效心跳；结合上方 HTTP 阶段和监听 PID 核对主机日志。"
+	}
+	c.diagnostics = append(c.diagnostics, result)
+}
+
 func (c *apiClient) probeService(ctx context.Context, port int) {
+	c.probeHeartbeat(ctx, port)
 	// These probes classify a live-state failure; their data never replaces statuses.
 	var config Config
 	configErr := c.quickJSON(ctx, port, "config", &config)
